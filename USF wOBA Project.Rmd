@@ -1,0 +1,313 @@
+---
+title: "USF wOBAs"
+author: "Nick Hanhan"
+date: "5/16/2020"
+output: html_document
+---
+
+```{r}
+library(baseballr)
+library(tidyverse)
+
+#For this project, I wanted to do explore a popular MLB stat that teams are using for evaluation and for scouting. wOBA is most of the calculation for the popular WAR (Wins above replacement) statistic. Many statisticians believe it is the best indicator to estimate runs because it measures not only how the runner reached base, but how.
+#The scales csv file uploaded is scales for every season, based on the wOBA formula. The scales change on how often each event occurs in the season. 
+#The numerator essentially tells us how much runs a player would be worth for the team and is one stat colleges should look to explore more into.
+
+#lookup school, San Francisco is this case for this project
+USF= school_id_lu("San Francisco")
+
+#read in the csv file that is attached that contains linear weights
+ncaa_scale = read.csv("ncaa_scale.csv", stringsAsFactors = F)
+```
+
+
+
+```{r}
+#select necessary variables and rename woba to lgwoba to avoid confusion
+ncaa_scale = ncaa_scale %>% select(year,division,wOBA,wBB,wHBP,w1B,w2B,w3B,wHR) %>% rename(lgwOBA = wOBA)
+
+#You have to use the edit function to edit the 2020 season to 2019
+#The import of the data from the baseball r package reads 2019 as 2020
+USF = edit(USF)
+```
+
+```{r}
+#create a list and loop through the years of 2013-2019 to get hitting data by player at USF
+USFHit <- list()
+for (i in 1:nrow(USF)) {
+  USFHit[[i]] <- ncaa_scrape(teamid = USF$school_id[i],year = USF$year[i], type = "batting")
+}
+
+library(plyr)
+#convert list of dataframes to a singular data frame
+USF = plyr::ldply(USFHit,data.frame)
+
+#Ensure all rows of school, conference, and division are properly names, as well as removed any observations with no player_id
+USF = USF %>% mutate(school = "USF", conference = "WCC", division = 1) %>% filter(is.na(player_id)==FALSE)
+
+```
+
+
+
+```{r}
+#This is to scrape Intentional walks from the ncaa website from 2013 to 2019 for USF, neccessary to calculate wOBA
+get_IBB <- function(player_id, year) {
+  #subsets the data by the unique year id
+  year_id <- subset(ncaa_season_id_lu, season == year, select = id)
+  #subsets the data by the unique batting id
+  batting_id <- subset(ncaa_season_id_lu, season == year, select = batting_id)
+  #obtains a url for the batter to then read the data table of player's totals by year
+  batting_url <- paste0("https://stats.ncaa.org/player/index?id=", year_id,"&stats_player_seq=", player_id,"&year_stat_category_id=", batting_id)
+  #reads the data table from the url
+  batting_payload <- xml2::read_html(batting_url)
+  #data cleaning after extracting table  
+  payload_df <- batting_payload %>%
+    rvest::html_nodes('table') %>%
+    .[3] %>%
+    rvest::html_table(fill = T) %>%
+    as.data.frame() %>%
+    .[-1,]
+  
+  names(payload_df) <- payload_df[1,]
+  
+  payload_df <- payload_df[-1,]
+  
+  year_df = data.frame(Year = c("2012-13", "2013-14", "2014-15", 
+                                "2015-16","2016-17","2017-18","2018-19","2019-20"),
+                       Season = c(2013,2014,2015,2016,2017,2018,2019,2020), stringsAsFactors = F)
+  
+  #join data frame and year data frame to filter by year and pull the IBBs
+  payload_df <- left_join(payload_df,year_df,by="Year")
+  ibb <- payload_df %>% filter(Season == {{year}}) %>% pull(IBB)
+  
+  
+  
+  
+  return(ibb)
+  
+}
+```
+
+
+```{r}
+#loop through each batter and pull IBB data (might take some time), has to go through 202 players
+
+install.packages("svMisc")
+library(svMisc)
+
+for (i in 1:nrow(USF)) {
+  svMisc::progress(i,nrow(USF))
+  USF$IBB[[i]] <- get_IBB(USF$player_id[i],USF$year[i])
+}
+```
+
+```{r}
+#Data cleaning, converting variables to numeric, replacing NAs with 0, adding the columns single and plate appearances
+USF = USF %>% mutate_at(vars(AB,H,X2B,X3B,HR,BB,HBP,SF,SH,IBB),as.numeric) %>% replace_na(list(H=0,X2B=0,X3B=0,HR=0,IBB=0,SF=0,SH=0,BB=0,HBP=0)) %>% mutate(X1B =(H-X2B-X3B-HR),  PA = AB+H+BB+HBP+SF+SH)
+
+#left join the ncaa_scales page with the data frame. Need the scales to calcuate the wOBAs for each season
+USF = left_join(USF,ncaa_scale,by=c("division","year"))
+
+```
+
+```{r}
+#create a function called get_woba that calculates each player's wOBA accurately by year
+get_woba <- function(df) {
+  colnames <- c("wBB","BB","wHBP","HBP","w1B","X1B","w2B","X2B","w3B","X3B","wHR","HR","PA","IBB")
+  if (!all(colnames %in% names(df))) warning("You must have the following variables in your dataset to calculate woBA: 'wBB','BB','wHBP','HBP','w1B','X1B','w2B','X2B','w3B','X3B','wHR','HR','PA','IBB','AB','SF")
+  df$wOBA <- round((((df$wBB * df$BB) + (df$wHBP * df$HBP) + (df$w1B * df$X1B) + (df$w2B * df$X2B) + 	(df$w3B * df$X3B) + (df$wHR * df$HR))/(df$AB+df$BB+df$SF + df$HBP -df$IBB)),3)
+  return(df)
+}
+
+#run the get wOBA function
+USF = get_woba(USF)
+```
+
+
+```{r}
+#display the Top hitters at USF from 2013-2019 with 200 PAs or more by wOBA, also did BA just for fun 
+head(USF %>%  filter(PA >= 200) %>% arrange(desc(wOBA)))
+head(USF %>%  filter(PA >= 200) %>% arrange(desc(BA)))
+#Bradley Zimmer had a 518 wOBA, comparable to JJ Bleday for Vanderbilt who had a 527 and was drated 4th overall by the Miami Marlins in 2019 
+```
+
+
+```{r}
+library(dplyr)
+#made a new data frame that has years and wobas and filtered it for complete cases so we didn't have pitchers on here, changed column names to year and wOBA
+
+
+
+USFwobas <- select(USF, year, select = c(year,wOBA))
+USFwobas <- USFwobas %>%
+  filter(complete.cases(select1,select2))
+
+library("data.table")
+setnames(USFwobas, old = c('select1','select2'), new = c('year','wOBA'))
+
+
+USF$year <- as.factor(USF$year)
+#Find the mean wOBA for each season, see if USF wOBA got progressively better or not 
+USF %>%
+  group_by(USF$year) %>%
+  summarize(mean_wOBA = mean(wOBA, na.rm = TRUE))
+
+USFwobas %>%
+  select(year, wOBA) %>%
+  filter(year == 2013) %>%
+  summarise(mean = mean(wOBA))
+#mean wOBA 2013-0.2545
+
+USFwobas %>%
+  select(year, wOBA) %>%
+  filter(year == 2014) %>%
+  summarise(mean = mean(wOBA))
+#0.2965
+
+USFwobas %>%
+  select(year, wOBA) %>%
+  filter(year == 2015) %>%
+  summarise(mean = mean(wOBA))
+#0.29275
+
+
+USFwobas %>%
+  select(year, wOBA) %>%
+  filter(year == 2016) %>%
+  summarise(mean = mean(wOBA))
+#0.29758
+
+USFwobas %>%
+  select(year, wOBA) %>%
+  filter(year == 2017) %>%
+  summarise(mean = mean(wOBA))
+#0.30717
+
+USFwobas %>%
+  select(year, wOBA) %>%
+  filter(year == 2018) %>%
+  summarise(mean = mean(wOBA))
+#0.302235
+
+USFwobas %>%
+  select(year, wOBA) %>%
+  filter(year == 2019) %>%
+  summarise(mean = mean(wOBA))
+#0.3329
+
+
+#wOBAs for USF 2013-2019, 2019 eing the best season, 2013 being not so great, very top heavy
+#2013	0.2545238			
+#2014	0.2988000			
+#2015	0.2935000			
+#2016	0.2980000			
+#2017	0.3071765			
+#2018	0.3027647			
+#2019	0.3329412	
+
+
+
+#wOBA Scale
+#Classification	Range
+#Elite	.400 and Above
+#Very Good	.371 to .399
+#Good	.321 to .370
+#Average	.320
+#Bad	.291 to .320
+#Very Bad	.290 and below
+
+```
+
+
+```{r}
+library(ggplot2)
+ggplot(USFwobas) +
+  geom_point(aes(year, wOBA))
+
+#Boxplot for 25%, 75% percentiles, and median for wOBAs for 2013-2019
+USF %>% 
+  filter(year %in% c("2013", "2014", "2015", "2016", "2017", "2018", "2019")) %>% 
+  ggplot() +
+  geom_boxplot(aes(x = year, y = wOBA, fill = year)) +
+  xlab("") +
+  ylab("wOBA") 
+#Medians shown with the black line in the middle
+#2013 had a really big gap for percentiles
+```
+
+```{r}
+USF$year <- as.factor(USF$year)
+
+#Did a boxplot by positions here for wOBAs 
+USF %>% 
+  filter(Pos %in% c("INF", "OF", "C")) %>% 
+  ggplot() +
+  geom_boxplot(aes(x = Pos, y = wOBA, fill = Pos)) +
+  xlab("") +
+  ylab("wOBA") 
+
+USF %>% 
+  filter(Pos %in% c("INF", "OF", "C")) %>% 
+  filter(year %in% c("2019")) %>%
+  ggplot() +
+  geom_boxplot(aes(x = Pos, y = wOBA, fill = Pos)) +
+  xlab("") +
+  ylab("wOBA")
+#Looks like OF have the closer spread of wOBA between 25th and 75th percentiles, big outlier on the inf with Allen Smoot in 2017.
+```
+
+
+```{r}
+#wOBAs for Tyler Villaroman
+install.packages("hrbrthemes")
+library(hrbrthemes)
+
+Villaroman <- subset(USF, Player== "Villaroman, Tyler")
+Villaroman$year <- as.factor(Villaroman$year)
+ggplot(Villaroman, aes(x=year, y=wOBA)) +
+  geom_line( color="grey") + 
+  geom_point(shape=21, color="black", fill="#69b3a2", size=6)+
+  theme_ipsum() +
+  ggtitle("Tyler Villaroman wOBA year by year")
+                
+USF %>%
+  filter(year == "2019") %>%
+  ggplot(aes(x = year, y = wOBA, colour = school)) +
+  geom_point(alpha = 0.3,  position = position_jitter()) + stat_smooth(method = "lm")
+
+#Tyler Villaroman improved every single year at USF and was off to his best season before covid-19. I think if he weren't to come back next season to USF, it would be tough to replace a guy like that at the top of the order and can field and is probably one of the faster guys in the WCC. 
+
+#The second graph shows all wOBAs for the team in 2019, two guys over the 400 threshold, which is considered elite. 
+
+
+
+
+```
+
+
+```{r}
+#Looking at wOBAs for the Catchers from 2015-2019
+USF %>%
+  filter(Player %in% c("Hodkinson, Chase", "Emery, Robert", "McCarthy, Thomas","Miroglio, Dominic", "O'Sullivan, Paul", "Matranga, Ryan","Valley, Blake","Danna, Peter", "McCullough, Justin")) %>%
+  ggplot(aes(x = year, y = wOBA, group = Player, color = Player)) +
+  geom_line()
+#Two of the Catchers were ineligible because they had 0 at bats
+#Few of the notables would be Dominic Miroglio who now plays in the Arizona Diamondbacks orgaization, Ryan Matranga, and Robert Emery who looked like he was on the way to another great season with USF.
+
+```
+
+```{r}
+wOBAreg <- lm(wOBA ~ BA + OBPct, USF)
+summary(wOBAreg)
+#Both Batting Average and On base percentage were significant and OBP had more correlation with wOBA which is expected given HBP and walks goes into the calculation.
+
+```
+
+
+```{r}
+wOBAhits <- lm(wOBA ~ X1B + X2B + X3B + HR, USF)
+summary(wOBAhits)
+#For this I was just curious to see which type of hit had more of an impact on wOBA and suprisingly it looks like the triple was although they were not very significant. A single was more significant however than the other type of hits.
+#Again though, R-Squared only is 44.91% of the data, so walks,hbp, sac flys are needed
+```
+
